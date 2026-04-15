@@ -336,10 +336,10 @@ dias  = list(range(1, 32))
 meses = {1:"Janeiro",2:"Fevereiro",3:"Marco",4:"Abril",5:"Maio",6:"Junho",
           7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
 # Defaults WoW: P2 = ultimos 7 dias (hoje - 6 ate hoje), P1 = 7 dias anteriores
-p2_def_fim = today
-p2_def_ini = today - datetime.timedelta(days=6)
-p1_def_fim = today - datetime.timedelta(days=7)
-p1_def_ini = today - datetime.timedelta(days=13)
+p2_def_fim = today - datetime.timedelta(days=1)
+p2_def_ini = today - datetime.timedelta(days=7)
+p1_def_fim = today - datetime.timedelta(days=8)
+p1_def_ini = today - datetime.timedelta(days=14)
 
 # Se as datas WoW estiverem fora do range da base, cai para o range disponivel
 def clamp(d, lo, hi): return max(lo, min(hi, d))
