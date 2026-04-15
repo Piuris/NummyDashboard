@@ -25,15 +25,30 @@ def get_secret(key, default=None):
 def perform_auth():
     base_url = get_secret("PAYTIME_BASE_URL", "https://api.paytime.com.br")
     url = f"{base_url}/v1/auth/login"
+    
+    # Payload EXATAMENTE igual ao seu auth.py original
     payload = {
-        "username": get_secret("PAYTIME_USER"),
-        "password": get_secret("PAYTIME_PASS")
+        "x-token": get_secret("PAYTIME_X_TOKEN"),
+        "authentication-key": get_secret("PAYTIME_AUTH_KEY"),
+        "integration-key": get_secret("PAYTIME_INTEGRATION_KEY")
     }
     
-    response = requests.post(url, json=payload, timeout=30)
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    
+    response = requests.post(url, json=payload, headers=headers, timeout=30)
     response.raise_for_status()
+    
     data = response.json()
-    return data.get("token") or data.get("access_token")
+    # Puxando o token com as mesmas margens de segurança do seu arquivo original
+    token = data.get("token") or data.get("access_token") or data.get("data", {}).get("token")
+    
+    if not token:
+        raise ValueError(f"Token não encontrado na resposta: {data}")
+        
+    return token
 
 def parse_transaction(tx: dict) -> dict:
     customer = tx.get("customer", {}) or {}
