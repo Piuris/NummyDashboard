@@ -207,6 +207,11 @@ AXIS_DEF = dict(
 st.markdown(f"""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    
     html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
     .stApp {{ background-color: {DARK_BG}; }}
     .block-container {{ padding-top: 3.5rem !important; padding-bottom: 2rem; }}
