@@ -14,7 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import os
-from datetime import datetime
+import datetime
 import requests
 import csv
 
