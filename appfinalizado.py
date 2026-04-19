@@ -85,7 +85,6 @@ def parse_transaction(tx: dict) -> dict:
 # --- FUNÇÕES DO EXPORT.PY ---
 def fetch_and_save_data(token):
     base_url = get_secret("PAYTIME_BASE_URL", "https://api.paytime.com.br")
-    url = f"{base_url}/v1/marketplace/transactions?perPage=30000"
     
     headers = {
         "accept": "application/json",
@@ -94,25 +93,65 @@ def fetch_and_save_data(token):
         "authorization": f"Bearer {token}",
     }
     
-    response = requests.get(url, headers=headers, timeout=120)
-    response.raise_for_status()
-    transactions = response.json()
+    # Define a data de corte (90 dias atrás a partir de hoje)
+    data_corte = (datetime.datetime.utcnow() - datetime.timedelta(days=90)).isoformat()
     
-    # Normaliza a lista de transações (ajustado conforme seu JSON)
-    if isinstance(transactions, dict):
-        transactions = transactions.get("data", [])
+    all_transactions = []
+    current_page = 1
+    per_page = 2500  # Lote seguro e rápido para não dar Timeout na API
+    
+    while True:
+        # st.write aqui dentro vai atualizar a caixinha de status na tela do cliente!
+        st.write(f"Baixando histórico... (Página {current_page})")
         
-    if not transactions:
+        url = f"{base_url}/v1/marketplace/transactions?page={current_page}&perPage={per_page}"
+        
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if isinstance(data, dict):
+            page_items = data.get("data", [])
+            last_page = data.get("lastPage", 1)
+        else:
+            page_items = data if isinstance(data, list) else []
+            last_page = current_page
+            
+        if not page_items:
+            break  # Se a página vier vazia, terminamos
+            
+        all_transactions.extend(page_items)
+        
+        # Pega a data da transação mais antiga desta página (a última da lista)
+        # As datas vêm no formato ISO "2026-04-14T...", então podemos comparar como texto
+        ultima_data_pagina = page_items[-1].get("created_at", "")
+        
+        # Se a data da transação mais antiga da página for menor que nossa data limite, paramos o loop
+        if ultima_data_pagina and ultima_data_pagina < data_corte:
+            st.write("Limite de 3 meses alcançado!")
+            break
+            
+        # Se chegamos na última página possível da API, paramos
+        if current_page >= last_page:
+            break
+            
+        current_page += 1
+
+    if not all_transactions:
         return False
 
-    # Processamento e Salvamento (Usando o nome fixo que definimos)
-    rows = [parse_transaction(tx) for tx in transactions]
+    st.write(f"Processando {len(all_transactions)} transações. Salvando CSV...")
+    
+    # Processamento e Salvamento
+    rows = [parse_transaction(tx) for tx in all_transactions]
     output_path = "export_transacoes.csv"
     
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys(), delimiter=";")
         writer.writeheader()
         writer.writerows(rows)
+        
     return True
 
 # --- INTERFACE NO STREAMLIT ---
