@@ -17,6 +17,7 @@ import os
 import datetime
 import requests
 import csv
+import io
 
 
 def get_secret(key, default=None):
@@ -449,6 +450,38 @@ with st.sidebar:
     st.markdown(
         f"<div style='font-size:0.72rem; color:#7A7A7A; margin-top:4px'>"
         f"Exibindo os <b style='color:#F0F0F0'>{top_n}</b> com maior volume perdido"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    st.markdown('---')
+    st.markdown("<p class='sidebar-title'>Exportar Dados</p>", unsafe_allow_html=True)
+
+    @st.cache_data
+    def convert_to_xlsx(df):
+        """Converte o DataFrame para bytes XLSX em memoria."""
+        df_export = df.copy()
+        # Excel nao suporta datetimes com timezone — remove o tzinfo
+        for col in df_export.select_dtypes(include=["datetimetz"]).columns:
+            df_export[col] = df_export[col].dt.tz_localize(None)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df_export.to_excel(writer, index=False, sheet_name='Transacoes')
+        return buffer.getvalue()
+
+    xlsx_bytes = convert_to_xlsx(df_raw)
+    filename = f"transacoes_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+
+    st.download_button(
+        label='⬇ Baixar dados (.xlsx)',
+        data=xlsx_bytes,
+        file_name=filename,
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        use_container_width=True,
+    )
+    st.markdown(
+        f"<div style='font-size:0.7rem; color:#7A7A7A; margin-top:4px; text-align:center'>"
+        f"{len(df_raw):,} transacoes · todos os status"
         f"</div>",
         unsafe_allow_html=True
     )
