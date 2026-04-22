@@ -459,15 +459,37 @@ with st.sidebar:
 
     @st.cache_data
     def convert_to_xlsx(df):
-        """Converte o DataFrame para bytes XLSX em memoria."""
         df_export = df.copy()
-        # Excel nao suporta datetimes com timezone — remove o tzinfo
-        for col in df_export.select_dtypes(include=["datetimetz"]).columns:
-            df_export[col] = df_export[col].dt.tz_localize(None)
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        
+        # 1. Garante o formato de data puro e remove o fuso horário (Timezone)
+        if "created_at" in df_export.columns:
+            df_export["created_at"] = pd.to_datetime(df_export["created_at"]).dt.tz_localize(None)
+        if "date" in df_export.columns:
+            df_export["date"] = pd.to_datetime(df_export["date"])
+            
+        output = io.BytesIO()
+        
+        # 2. Cria o arquivo usando openpyxl
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_export.to_excel(writer, index=False, sheet_name='Transacoes')
-        return buffer.getvalue()
+            
+            # 3. MÁGICA: Acessa a planilha gerada para forçar o estilo das células
+            worksheet = writer.sheets['Transacoes']
+            
+            # Localiza qual é o número da coluna 'created_at' e 'date'
+            idx_created = df_export.columns.get_loc("created_at") + 1 if "created_at" in df_export.columns else None
+            idx_date = df_export.columns.get_loc("date") + 1 if "date" in df_export.columns else None
+            
+            # Aplica a máscara visual da linha 2 até a última (pulando o cabeçalho)
+            for row in range(2, worksheet.max_row + 1):
+                if idx_created:
+                    # Formato completo com horas
+                    worksheet.cell(row=row, column=idx_created).number_format = 'dd/mm/yyyy hh:mm:ss'
+                if idx_date:
+                    # Formato apenas dia, mês e ano
+                    worksheet.cell(row=row, column=idx_date).number_format = 'dd/mm/yyyy'
+                    
+        return output.getvalue()
 
     xlsx_bytes = convert_to_xlsx(df_raw)
     filename = f"transacoes_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
