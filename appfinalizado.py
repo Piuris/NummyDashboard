@@ -441,7 +441,7 @@ with st.sidebar:
     top_n = st.slider(
         label='top_n_slider',
         min_value=5,
-        max_value=200,
+        max_value=1000,
         value=15,
         step=5,
         label_visibility='collapsed',
