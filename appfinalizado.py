@@ -722,17 +722,47 @@ st.markdown(
     f"</div>",
     unsafe_allow_html=True
 )
-st.markdown(f"<p class='section-label'>Ranking — Top {top_n} Churns por Volume Perdido ({len(churned)} total · {len(ests_p1)} clientes P1)</p>", unsafe_allow_html=True)
+
+st.markdown(f"<p class='section-label'>Ranking — Top {top_n} Estabelecimentos (Churn & Retidos)</p>", unsafe_allow_html=True)
+
+# --- NOVO: Botões para alternar a ordenação ---
+ordem = st.radio(
+    "Modo de Exibição da Tabela:",
+    options=[
+        "🔴 Foco em Churn (Maior perda de volume no P1)", 
+        "🟢 Foco em Retidos (Maior queda de volume no período)"
+    ],
+    horizontal=True,
+    label_visibility="collapsed"
+)
 
 medal_map = {1:"medal-gold", 2:"medal-silver", 3:"medal-bronze"}
-medal_lbl = {1:"1o", 2:"2o", 3:"3o"}
+medal_lbl = {1:"1º", 2:"2º", 3:"3º"}
 
-# Ranking: apenas churned, ordenado por maior volume perdido
-all_ests_rank = sorted(churned, key=lambda e: -vol_p1.get(e, 0))[:top_n]
+# --- Lógica de Ordenação Mista ---
+if "Foco em Churn" in ordem:
+    # 1º Mostra os Churns (ordenados do MAIOR volume perdido para o menor)
+    # 2º Se sobrar espaço no Top N, mostra os Retidos
+    all_ests_rank = sorted(
+        list(churned) + list(retained), 
+        key=lambda e: (0 if e in churned else 1, -vol_p1.get(e, 0))
+    )[:top_n]
+else:
+    # 1º Mostra os Retidos (ordenados pela MAIOR QUEDA: P2 - P1 mais negativo vem primeiro)
+    # 2º Se sobrar espaço no Top N, mostra os Churns no final
+    all_ests_rank = sorted(
+        list(churned) + list(retained), 
+        key=lambda e: (0 if e in retained else 1, vol_p2.get(e, 0) - vol_p1.get(e, 0))
+    )[:top_n]
 
 rows_html = ""
 for pos, est in enumerate(all_ests_rank, 1):
-    tag = '<span class="tag-churn">CHURN</span>'
+    # Lógica para a Tag Colorida
+    if est in churned:
+        tag = '<span class="tag-churn">CHURN</span>'
+    else:
+        tag = '<span class="tag-retain">RETIDO</span>'
+        
     v1e  = vol_p1.get(est, 0)
     v2e  = vol_p2.get(est, 0)
     c1e  = cnt_p1.get(est, 0)
@@ -774,7 +804,7 @@ st.markdown(f"""
 </table>
 <br>
 <div style='display:flex; gap:20px; font-size:0.75rem; color:{MUTED}; flex-wrap:wrap'>
-    <span style='color:{RED}'>CHURN = estava no P1, sumiu no P2 · ordenado por volume perdido</span>
-    <span style='color:{MUTED}'>Retidos ({len(retained)}) e novos ({len(new_ests)}) omitidos dos graficos para legibilidade</span>
-    <span style='color:{AMBER}'>TPV ZERO = ativo mas sem faturamento real no P2</span>
+    <span style='color:{RED}'>CHURN = Estava no P1, sumiu no P2</span>
+    <span style='color:{GREEN}'>RETIDO = Ativo no P1 e P2 (Risco se o P2 for muito baixo)</span>
+    <span style='color:{AMBER}'>TPV ZERO = Ativo, mas sem faturamento real no P2</span>
 </div>""", unsafe_allow_html=True)
