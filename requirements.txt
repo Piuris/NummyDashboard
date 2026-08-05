@@ -3,3 +3,4 @@ pandas
 plotly
 requests
 openpyxl
+starlette<0.40.0
