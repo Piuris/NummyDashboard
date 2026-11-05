@@ -18,6 +18,10 @@ import datetime
 import requests
 import csv
 import io
+import tempfile
+
+SYNC_DAYS = 90
+DEFAULT_MAX_PAGES = 400
 
 
 def get_secret(key, default=None):
@@ -86,118 +90,145 @@ def parse_transaction(tx: dict) -> dict:
 # --- FUNÇÕES DO EXPORT.PY ---
 def fetch_and_save_data(token):
     base_url = get_secret("PAYTIME_BASE_URL", "https://api.paytime.com.br")
-    
+    max_pages = int(get_secret("PAYTIME_MAX_PAGES", DEFAULT_MAX_PAGES))
+
     headers = {
         "accept": "application/json",
         "integration-key": get_secret("PAYTIME_INTEGRATION_KEY"),
         "x-token": get_secret("PAYTIME_X_TOKEN"),
         "authorization": f"Bearer {token}",
     }
-    
-    # Define a data de corte (90 dias atrás a partir de hoje)
-    data_corte = (datetime.datetime.utcnow() - datetime.timedelta(days=90)).isoformat()
-    
-    all_transactions = []
+
+    data_corte = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=SYNC_DAYS)
+
+    output_path = "export_transacoes.csv"
     current_page = 1
     per_page = 2500  # Lote seguro e rápido para não dar Timeout na API
-    
-    while True:
-        # st.write aqui dentro vai atualizar a caixinha de status na tela do cliente!
-        st.write(f"Baixando histórico... (Página {current_page})")
-        
-        url = f"{base_url}/v1/marketplace/transactions?page={current_page}&perPage={per_page}"
-        
-        response = requests.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if isinstance(data, dict):
-            page_items = data.get("data", [])
-            last_page = data.get("lastPage", 1)
-        else:
-            page_items = data if isinstance(data, list) else []
-            last_page = current_page
-            
-        if not page_items:
-            break  # Se a página vier vazia, terminamos
-            
-        all_transactions.extend(page_items)
-        
-        # Pega a data da transação mais antiga desta página (a última da lista)
-        # As datas vêm no formato ISO "2026-04-14T...", então podemos comparar como texto
-        ultima_data_pagina = page_items[-1].get("created_at", "")
-        
-        # Se a data da transação mais antiga da página for menor que nossa data limite, paramos o loop
-        if ultima_data_pagina and ultima_data_pagina < data_corte:
-            st.write("Limite de 3 meses alcançado!")
-            break
-            
-        # Se chegamos na última página possível da API, paramos
-        if current_page >= last_page:
-            break
-            
-        current_page += 1
+    total_recebidas = 0
+    total_salvas = 0
+    total_sem_data = 0
+    progresso = st.empty()  # Atualiza a mesma linha em vez de acumular uma por página
 
-    if not all_transactions:
-        return False
+    # Grava em um arquivo temporário: o CSV atual só é trocado se o download terminar bem
+    fd, tmp_path = tempfile.mkstemp(suffix=".csv", dir=".")
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as f:
+            writer = None
 
-    st.write(f"Processando {len(all_transactions)} transações. Salvando CSV...")
-    
-    # Processamento e Salvamento
-    rows = [parse_transaction(tx) for tx in all_transactions]
-    output_path = "export_transacoes.csv"
-    
-    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys(), delimiter=";")
-        writer.writeheader()
-        writer.writerows(rows)
-        
-    return True
+            while True:
+                if current_page > max_pages:
+                    raise RuntimeError(
+                        f"Limite de {max_pages} páginas atingido antes de chegar a {SYNC_DAYS} dias. "
+                        "Os dados atuais foram mantidos. Se o volume for real, aumente PAYTIME_MAX_PAGES nos secrets."
+                    )
+
+                url = f"{base_url}/v1/marketplace/transactions?page={current_page}&perPage={per_page}"
+
+                response = requests.get(url, headers=headers, timeout=60)
+                response.raise_for_status()
+
+                data = response.json()
+
+                if isinstance(data, dict):
+                    page_items = data.get("data", [])
+                    last_page = data.get("lastPage", 1)
+                else:
+                    page_items = data if isinstance(data, list) else []
+                    last_page = current_page
+
+                if not page_items:
+                    break  # Se a página vier vazia, terminamos
+
+                datas = pd.to_datetime(
+                    pd.Series([tx.get("created_at") for tx in page_items], dtype="object"),
+                    errors="coerce", utc=True,
+                )
+                sem_data = datas.isna()
+                manter = (datas >= data_corte) | sem_data
+
+                rows = [parse_transaction(tx) for tx, ok in zip(page_items, manter) if ok]
+                if rows:
+                    if writer is None:
+                        writer = csv.DictWriter(f, fieldnames=rows[0].keys(), delimiter=";")
+                        writer.writeheader()
+                    writer.writerows(rows)
+
+                total_recebidas += len(page_items)
+                total_salvas += len(rows)
+                total_sem_data += int(sem_data.sum())
+                mais_antiga = datas.min()
+                mais_antiga_txt = mais_antiga.strftime("%d/%m/%Y") if pd.notna(mais_antiga) else "sem data"
+                progresso.write(
+                    f"Página {current_page} de {last_page} · {len(page_items)} recebidas nesta página · "
+                    f"mais antiga: {mais_antiga_txt} · {total_salvas} salvas de {total_recebidas}"
+                )
+
+                # Para quando uma página inteira estiver fora do período
+                if not manter.any():
+                    st.write(f"Limite de {SYNC_DAYS} dias alcançado!")
+                    break
+
+                # Se chegamos na última página possível da API, paramos
+                if current_page >= last_page:
+                    break
+
+                current_page += 1
+
+        if total_sem_data:
+            # Guardado na sessão porque a página recarrega logo após a sincronização
+            st.session_state["sync_aviso"] = (
+                f"{total_sem_data} transações vieram sem data válida e não entram nos períodos do dashboard."
+            )
+
+        if total_salvas == 0:
+            return False
+
+        os.replace(tmp_path, output_path)
+        return True
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def run_sync():
+    with st.status("Iniciando sincronização...", expanded=True) as status:
+        try:
+            status.write("Autenticando na API...")
+            token = perform_auth()
+
+            status.write("Buscando transações (isso pode demorar)...")
+            sucesso = fetch_and_save_data(token)
+
+            if sucesso:
+                status.update(label="Sincronização concluída!", state="complete", expanded=False)
+                st.toast("Dados atualizados com sucesso!", icon="✅")
+                st.rerun()
+            else:
+                status.update(label="Nenhum dado novo encontrado.", state="error")
+        except Exception as e:
+            status.update(label="Erro na sincronização", state="error")
+            st.error(f"Detalhes: {e}")
+
 
 # --- INTERFACE NO STREAMLIT ---
 with st.sidebar:
     st.markdown("---")
     st.markdown("<p class='sidebar-title'>Gerenciamento de Dados</p>", unsafe_allow_html=True)
-    
+
     if st.button("🔄 Sincronizar Paytime", type="primary", use_container_width=True):
-        with st.status("Iniciando sincronização...", expanded=True) as status:
-            try:
-                status.write("Autenticando na API...")
-                token = perform_auth()
-                
-                status.write("Buscando transações (isso pode demorar)...")
-                sucesso = fetch_and_save_data(token)
-                
-                if sucesso:
-                    status.update(label="Sincronização concluída!", state="complete", expanded=False)
-                    st.toast("Dados atualizados com sucesso!", icon="✅")
-                    st.rerun()
-                else:
-                    status.update(label="Nenhum dado novo encontrado.", state="error")
-            except Exception as e:
-                status.update(label=f"Erro na sincronização", state="error")
-                st.error(f"Detalhes: {e}")
+        run_sync()
 
 st.markdown("<p class='dash-title'><span>Nummy</span> · Dashboard de Churn</p>", unsafe_allow_html=True)
 
 # 1. Cria uma área amigável para o cliente atualizar os dados
 with st.expander("🔄 Atualizar Dados da Paytime", expanded=False):
     st.write("Clique no botão abaixo para buscar as transações mais recentes da API.")
-    
+
     if st.button("Buscar Novas Transações", type="primary"):
-        with st.spinner("Conectando à Paytime e baixando histórico... Isso pode levar um minuto."):
-            try:
-                # Aqui você chama as funções que já criou no export.py!
-                # token = load_token()
-                # headers = build_headers(token)
-                # transacoes = fetch_transactions(headers)
-                # save_csv(transacoes, output_dir=".") 
-                
-                st.success("Dados atualizados com sucesso! A página será recarregada.")
-                st.rerun() # Faz o dashboard piscar e carregar o CSV novo automaticamente
-            except Exception as e:
-                st.error(f"Erro ao atualizar: {e}")
+        run_sync()
+
+if "sync_aviso" in st.session_state:
+    st.warning(st.session_state.pop("sync_aviso"))
 
 st.markdown("---")
 
@@ -326,8 +357,9 @@ def date_selector(prefix, default_date, all_years, dias, meses, label):
     try:    return datetime.date(a, m_num, d)
     except: return default_date
 
-@st.cache_data
-def load_data(path):
+# csv_mtime entra na chave do cache: quando a sincronização grava um CSV novo, os dados são relidos
+@st.cache_data(max_entries=1)
+def load_data(path, csv_mtime):
     df = pd.read_csv(path, sep=";", encoding="utf-8-sig", dtype=str)
     df.columns = df.columns.str.strip()
     for col in ["amount","original_amount","fees","installments"]:
@@ -367,7 +399,8 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 try:
-    df_raw = load_data(CSV_PATH)
+    csv_mtime = os.path.getmtime(CSV_PATH)
+    df_raw = load_data(CSV_PATH, csv_mtime)
 except FileNotFoundError:
     st.error(f"Arquivo '{CSV_PATH}' nao encontrado.")
     st.stop()
@@ -457,29 +490,30 @@ with st.sidebar:
     st.markdown('---')
     st.markdown("<p class='sidebar-title'>Exportar Dados</p>", unsafe_allow_html=True)
 
-    @st.cache_data
-    def convert_to_xlsx(df):
-        df_export = df.copy()
-        
+    # O "_" em _df evita que o Streamlit faça o hash do DataFrame; quem identifica a versão é o csv_mtime
+    @st.cache_data(max_entries=1)
+    def convert_to_xlsx(_df, csv_mtime):
+        df_export = _df.copy()
+
         # 1. Garante o formato de data puro e remove o fuso horário (Timezone)
         if "created_at" in df_export.columns:
             df_export["created_at"] = pd.to_datetime(df_export["created_at"]).dt.tz_localize(None)
         if "date" in df_export.columns:
             df_export["date"] = pd.to_datetime(df_export["date"])
-            
+
         output = io.BytesIO()
-        
+
         # 2. Cria o arquivo usando openpyxl
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_export.to_excel(writer, index=False, sheet_name='Transacoes')
-            
+
             # 3. MÁGICA: Acessa a planilha gerada para forçar o estilo das células
             worksheet = writer.sheets['Transacoes']
-            
+
             # Localiza qual é o número da coluna 'created_at' e 'date'
             idx_created = df_export.columns.get_loc("created_at") + 1 if "created_at" in df_export.columns else None
             idx_date = df_export.columns.get_loc("date") + 1 if "date" in df_export.columns else None
-            
+
             # Aplica a máscara visual da linha 2 até a última (pulando o cabeçalho)
             for row in range(2, worksheet.max_row + 1):
                 if idx_created:
@@ -488,19 +522,23 @@ with st.sidebar:
                 if idx_date:
                     # Formato apenas dia, mês e ano
                     worksheet.cell(row=row, column=idx_date).number_format = 'dd/mm/yyyy'
-                    
+
         return output.getvalue()
 
-    xlsx_bytes = convert_to_xlsx(df_raw)
-    filename = f"transacoes_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+    # Gerar o XLSX é a etapa mais lenta do app, então ele só é montado quando alguém pede
+    if st.button('📄 Gerar planilha (.xlsx)', use_container_width=True):
+        with st.spinner("Gerando planilha..."):
+            convert_to_xlsx(df_raw, csv_mtime)
+        st.session_state["xlsx_csv_mtime"] = csv_mtime
 
-    st.download_button(
-        label='⬇ Baixar dados (.xlsx)',
-        data=xlsx_bytes,
-        file_name=filename,
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        use_container_width=True,
-    )
+    if st.session_state.get("xlsx_csv_mtime") == csv_mtime:
+        st.download_button(
+            label='⬇ Baixar dados (.xlsx)',
+            data=convert_to_xlsx(df_raw, csv_mtime),
+            file_name=f"transacoes_{datetime.date.today().strftime('%Y%m%d')}.xlsx",
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            use_container_width=True,
+        )
     st.markdown(
         f"<div style='font-size:0.7rem; color:#7A7A7A; margin-top:4px; text-align:center'>"
         f"{len(df_raw):,} transacoes · todos os status"
