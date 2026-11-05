@@ -19,9 +19,12 @@ import requests
 import csv
 import io
 import tempfile
+import time
 
 SYNC_DAYS = 90
-DEFAULT_MAX_PAGES = 400
+DEFAULT_MAX_PAGES = 2000  # A API devolve 100 transações por página
+MAX_RETRIES = 5
+RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
 def get_secret(key, default=None):
@@ -87,6 +90,37 @@ def parse_transaction(tx: dict) -> dict:
         "plan_name":          plan.get("name", ""),
     }
 
+def get_page(url, headers):
+    """Busca uma página, repetindo em falhas temporárias e renovando o token se ele expirar."""
+    token_renovado = False
+    tentativa = 0
+    while True:
+        try:
+            response = requests.get(url, headers=headers, timeout=60)
+            if response.status_code == 401 and not token_renovado:
+                token_renovado = True
+                headers["authorization"] = f"Bearer {perform_auth()}"
+                print("[sync] Token renovado", flush=True)
+                continue
+            if response.status_code not in RETRY_STATUS:
+                response.raise_for_status()
+                return response.json()
+            motivo = f"HTTP {response.status_code}"
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.JSONDecodeError,
+        ) as e:
+            motivo = type(e).__name__
+
+        tentativa += 1
+        if tentativa > MAX_RETRIES:
+            raise RuntimeError(f"{motivo} depois de {MAX_RETRIES} novas tentativas")
+        print(f"[sync] {motivo}: nova tentativa {tentativa} de {MAX_RETRIES}", flush=True)
+        time.sleep(2 ** tentativa)
+
+
 # --- FUNÇÕES DO EXPORT.PY ---
 def fetch_and_save_data(token):
     base_url = get_secret("PAYTIME_BASE_URL", "https://api.paytime.com.br")
@@ -103,7 +137,7 @@ def fetch_and_save_data(token):
 
     output_path = "export_transacoes.csv"
     current_page = 1
-    per_page = 2500  # Lote seguro e rápido para não dar Timeout na API
+    per_page = 2500  # A API pode devolver menos que o pedido
     total_recebidas = 0
     total_salvas = 0
     total_sem_data = 0
@@ -124,10 +158,14 @@ def fetch_and_save_data(token):
 
                 url = f"{base_url}/v1/marketplace/transactions?page={current_page}&perPage={per_page}"
 
-                response = requests.get(url, headers=headers, timeout=60)
-                response.raise_for_status()
-
-                data = response.json()
+                try:
+                    data = get_page(url, headers)
+                except Exception as e:
+                    print(f"[sync] Falha na página {current_page}: {e}", flush=True)
+                    raise RuntimeError(
+                        f"Falha na página {current_page}, com {total_recebidas} transações já recebidas: {e}. "
+                        "Os dados atuais foram mantidos."
+                    ) from e
 
                 if isinstance(data, dict):
                     page_items = data.get("data", [])
@@ -162,6 +200,10 @@ def fetch_and_save_data(token):
                     f"Página {current_page} de {last_page} · {len(page_items)} recebidas nesta página · "
                     f"mais antiga: {mais_antiga_txt} · {total_salvas} salvas de {total_recebidas}"
                 )
+
+                # Registra nos logs do app, para saber até onde foi se a conexão ou o app cair
+                if current_page % 50 == 0:
+                    print(f"[sync] Página {current_page} de {last_page}, mais antiga: {mais_antiga_txt}", flush=True)
 
                 # Para quando uma página inteira estiver fora do período
                 if not manter.any():
@@ -282,6 +324,14 @@ st.markdown(f"""
     #MainMenu {{visibility: hidden;}}
     header {{visibility: hidden;}}
     footer {{visibility: hidden;}}
+
+    /* O botão de reabrir o menu lateral fica dentro do header escondido acima */
+    [data-testid="stExpandSidebarButton"],
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"] {{visibility: visible !important;}}
+    [data-testid="stExpandSidebarButton"] *,
+    [data-testid="stSidebarCollapsedControl"] *,
+    [data-testid="collapsedControl"] * {{color: {TEXT_MAIN} !important;}}
     
     html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
     .stApp {{ background-color: {DARK_BG}; }}
