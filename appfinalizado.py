@@ -10,404 +10,90 @@ Execucao:
 """
 
 import datetime
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
+import gzip
 import os
-import datetime
-import requests
-import csv
-import io
-import json
+import shutil
 import tempfile
 import threading
-import time
+import io
 
-SYNC_DAYS = 90
-DEFAULT_MAX_PAGES = 2000  # A API devolve 100 transações por página
-MAX_RETRIES = 5
-RETRY_STATUS = {429, 500, 502, 503, 504}
-OUTPUT_CSV = "export_transacoes.csv"
-PARTIAL_CSV = "export_transacoes.parcial.csv"
-PARTIAL_STATE = "export_transacoes.parcial.json"
-PARTIAL_MAX_AGE_HOURS = 24
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
 
-
-def get_secret(key, default=None):
-    return st.secrets.get(key, default)
-
-def get_sync_config():
-    return {
-        "base_url": get_secret("PAYTIME_BASE_URL", "https://api.paytime.com.br"),
-        "x_token": get_secret("PAYTIME_X_TOKEN"),
-        "auth_key": get_secret("PAYTIME_AUTH_KEY"),
-        "integration_key": get_secret("PAYTIME_INTEGRATION_KEY"),
-        "max_pages": int(get_secret("PAYTIME_MAX_PAGES", DEFAULT_MAX_PAGES)),
-    }
+CSV_PATH = "export_transacoes.csv"
+VERSION_PATH = "export_transacoes.versao"
+DATA_RELEASE = "dados"
+DATA_CHECK_SECONDS = 600
+STALE_AFTER = datetime.timedelta(days=2)
+BRASILIA = datetime.timezone(datetime.timedelta(hours=-3))
 
 
-def perform_auth(config):
-    url = f"{config['base_url']}/v1/auth/login"
+def github_headers(accept="application/vnd.github+json"):
+    return {"accept": accept, "authorization": f"Bearer {st.secrets['DADOS_GITHUB_TOKEN']}"}
 
-    # Payload EXATAMENTE igual ao seu auth.py original
-    payload = {
-        "x-token": config["x_token"],
-        "authentication-key": config["auth_key"],
-        "integration-key": config["integration_key"],
-    }
 
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-    }
-    
-    response = requests.post(url, json=payload, headers=headers, timeout=30)
+@st.cache_data(ttl=DATA_CHECK_SECONDS, show_spinner=False)
+def latest_data_asset():
+    """Consulta o arquivo mais recente publicado pela sincronização no repositório privado."""
+    api_url = st.secrets.get("DADOS_API_URL", "https://api.github.com")
+    url = f"{api_url}/repos/{st.secrets['DADOS_REPO']}/releases/tags/{DATA_RELEASE}"
+    response = requests.get(url, headers=github_headers(), timeout=30)
     response.raise_for_status()
-    
-    data = response.json()
-    # Puxando o token com as mesmas margens de segurança do seu arquivo original
-    token = data.get("token") or data.get("access_token") or data.get("data", {}).get("token")
-    
-    if not token:
-        raise ValueError(f"Token não encontrado na resposta: {data}")
-        
-    return token
-
-def parse_transaction(tx: dict) -> dict:
-    customer = tx.get("customer", {}) or {}
-    card     = tx.get("card", {})      or {}
-    estab    = tx.get("establishment", {}) or {}
-    acquirer = tx.get("acquirer", {})  or {}
-    plan     = tx.get("plan", {})      or {}
-
-    return {
-        "id":                 tx.get("_id", ""),
-        "status":             tx.get("status", ""),
-        "type":               tx.get("type", ""),
-        "amount":             tx.get("amount", ""),
-        "original_amount":    tx.get("original_amount", ""),
-        "fees":               tx.get("fees", ""),
-        "installments":       tx.get("installments", ""),
-        "gateway_key":        tx.get("gateway_key", ""),
-        "gateway_auth":       tx.get("gateway_authorization", ""),
-        "created_at":         tx.get("created_at", ""),
-        "customer_name":      f"{customer.get('first_name','')} {customer.get('last_name','')}".strip(),
-        "customer_document":  customer.get("document", ""),
-        "customer_email":     customer.get("email", ""),
-        "customer_phone":     customer.get("phone", ""),
-        "card_brand":         card.get("brand_name", ""),
-        "card_first4":        card.get("first4_digits", ""),
-        "card_last4":         card.get("last4_digits", ""),
-        "card_holder":        card.get("holder_name", ""),
-        "establishment_id":   estab.get("id", ""),
-        "establishment_name": (estab.get("first_name") or "").strip(),
-        "acquirer":           acquirer.get("name", ""),
-        "plan_name":          plan.get("name", ""),
-    }
-
-def get_page(url, headers, config):
-    """Busca uma página, repetindo em falhas temporárias e renovando o token se ele expirar."""
-    token_renovado = False
-    tentativa = 0
-    while True:
-        try:
-            response = requests.get(url, headers=headers, timeout=60)
-            if response.status_code == 401 and not token_renovado:
-                token_renovado = True
-                headers["authorization"] = f"Bearer {perform_auth(config)}"
-                print("[sync] Token renovado", flush=True)
-                continue
-            if response.status_code not in RETRY_STATUS:
-                response.raise_for_status()
-                return response.json()
-            motivo = f"HTTP {response.status_code}"
-        except (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ChunkedEncodingError,
-            requests.exceptions.JSONDecodeError,
-        ) as e:
-            motivo = type(e).__name__
-
-        tentativa += 1
-        if tentativa > MAX_RETRIES:
-            raise RuntimeError(f"{motivo} depois de {MAX_RETRIES} novas tentativas")
-        print(f"[sync] {motivo}: nova tentativa {tentativa} de {MAX_RETRIES}", flush=True)
-        time.sleep(2 ** tentativa)
+    assets = [a for a in response.json().get("assets", []) if a["name"].startswith("transacoes-")]
+    if not assets:
+        return None
+    asset = max(assets, key=lambda a: a["name"])
+    return {"name": asset["name"], "url": asset["url"], "updated_at": asset["updated_at"]}
 
 
-# --- FUNÇÕES DO EXPORT.PY ---
 @st.cache_resource
-def sync_job():
-    # Compartilhado entre as sessões: todas veem o mesmo progresso e só um download roda por vez
-    return {"lock": threading.Lock(), "thread": None, "run_id": 0, "status": "idle",
-            "progress": "", "error": None, "aviso": None}
+def data_lock():
+    return threading.Lock()
 
 
-def clear_partial():
-    for path in (PARTIAL_CSV, PARTIAL_STATE):
-        if os.path.exists(path):
-            os.remove(path)
-
-
-def load_partial_state():
-    """Devolve o progresso salvo, ou None se não houver um download recente para continuar."""
+def local_data_version():
     try:
-        with open(PARTIAL_STATE, encoding="utf-8") as f:
-            state = json.load(f)
-        idade = pd.Timestamp.now(tz="UTC") - pd.Timestamp(state["started_at"])
-        if idade > pd.Timedelta(hours=PARTIAL_MAX_AGE_HOURS):
-            return None
-        if os.path.getsize(PARTIAL_CSV) < state["offset"]:
-            return None
-        return state
-    except (OSError, ValueError, KeyError, TypeError):
+        with open(VERSION_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
         return None
 
 
-def save_partial_state(state):
-    tmp_path = f"{PARTIAL_STATE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-    os.replace(tmp_path, PARTIAL_STATE)
-
-
-def publish_partial():
-    """Troca o CSV do dashboard pelo parcial completo, sem transações repetidas."""
-    # Transações novas empurram as antigas para a página seguinte, então a mesma pode vir duas vezes
-    vistos = set()
-    repetidas = 0
-    fd, tmp_path = tempfile.mkstemp(suffix=".csv", dir=".")
+def download_data(asset):
+    gz_fd, gz_path = tempfile.mkstemp(suffix=".csv.gz", dir=".")
+    csv_fd, csv_path = tempfile.mkstemp(suffix=".csv", dir=".")
     try:
-        with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as saida, \
-                open(PARTIAL_CSV, newline="", encoding="utf-8-sig") as entrada:
-            leitor = csv.reader(entrada, delimiter=";")
-            escritor = csv.writer(saida, delimiter=";")
-            cabecalho = next(leitor)
-            escritor.writerow(cabecalho)
-            pos_id = cabecalho.index("id")
-            for linha in leitor:
-                tx_id = linha[pos_id]
-                if tx_id and tx_id in vistos:
-                    repetidas += 1
-                    continue
-                vistos.add(tx_id)
-                escritor.writerow(linha)
-        os.replace(tmp_path, OUTPUT_CSV)
+        with os.fdopen(gz_fd, "wb") as destino:
+            with requests.get(asset["url"], headers=github_headers("application/octet-stream"),
+                              stream=True, timeout=120) as response:
+                response.raise_for_status()
+                for bloco in response.iter_content(chunk_size=1024 * 1024):
+                    destino.write(bloco)
+        with gzip.open(gz_path, "rb") as origem, os.fdopen(csv_fd, "wb") as destino:
+            shutil.copyfileobj(origem, destino)
+        os.replace(csv_path, CSV_PATH)
+        with open(VERSION_PATH, "w", encoding="utf-8") as f:
+            f.write(asset["name"])
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-    print(f"[sync] Concluída: {len(vistos)} transações, {repetidas} repetidas removidas", flush=True)
+        for path in (gz_path, csv_path):
+            if os.path.exists(path):
+                os.remove(path)
 
 
-def run_sync_job(job, config):
-    try:
-        token = perform_auth(config)
-        job["status"] = "done" if download_transactions(token, config, job) else "empty"
-    except Exception as e:
-        print(f"[sync] Erro: {e!r}", flush=True)
-        job["error"] = str(e)
-        job["status"] = "error"
+def sync_local_data():
+    """Atualiza o CSV local se houver versão nova. Em caso de falha, mantém o que já foi baixado."""
+    asset = latest_data_asset()
+    if asset is None:
+        return None
+    if local_data_version() != asset["name"] or not os.path.exists(CSV_PATH):
+        with data_lock():
+            if local_data_version() != asset["name"] or not os.path.exists(CSV_PATH):
+                with st.spinner("Baixando os dados mais recentes..."):
+                    download_data(asset)
+    return asset
 
-
-def start_sync():
-    """Inicia o download em segundo plano, que continua mesmo se a aba fechar ou a conexão cair."""
-    job = sync_job()
-    with job["lock"]:
-        if job["thread"] is not None and job["thread"].is_alive():
-            return False
-        job.update(run_id=job["run_id"] + 1, status="running", progress="Iniciando sincronização...",
-                   error=None, aviso=None)
-        job["thread"] = threading.Thread(target=run_sync_job, args=(job, get_sync_config()), daemon=True)
-        job["thread"].start()
-    return True
-
-
-def download_transactions(token, config, job):
-    base_url = config["base_url"]
-    max_pages = config["max_pages"]
-
-    headers = {
-        "accept": "application/json",
-        "integration-key": config["integration_key"],
-        "x-token": config["x_token"],
-        "authorization": f"Bearer {token}",
-    }
-
-    per_page = 2500  # A API pode devolver menos que o pedido
-    state = load_partial_state()
-    retomando = state is not None
-
-    if retomando:
-        # Descarta o que foi gravado depois do último progresso salvo, como uma linha cortada ao meio
-        with open(PARTIAL_CSV, "r+b") as f:
-            f.truncate(state["offset"])
-        job["progress"] = f"Continuando da página {state['next_page']}..."
-        print(f"[sync] Retomando da página {state['next_page']}", flush=True)
-    else:
-        clear_partial()
-        state = {
-            "started_at": pd.Timestamp.now(tz="UTC").isoformat(),
-            "next_page": 1,
-            "offset": 0,
-            "recebidas": 0,
-            "salvas": 0,
-            "sem_data": 0,
-        }
-
-    data_corte = pd.Timestamp(state["started_at"]) - pd.Timedelta(days=SYNC_DAYS)
-    current_page = state["next_page"]
-
-    # O arquivo parcial fica no disco até o fim, e o CSV do dashboard só é trocado com o download completo
-    with open(PARTIAL_CSV, "a" if retomando else "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=parse_transaction({}).keys(), delimiter=";")
-        if not retomando:
-            writer.writeheader()
-
-        while True:
-            if current_page > max_pages:
-                raise RuntimeError(
-                    f"Limite de {max_pages} páginas atingido antes de chegar a {SYNC_DAYS} dias. "
-                    "Os dados atuais foram mantidos. Se o volume for real, aumente PAYTIME_MAX_PAGES nos secrets."
-                )
-
-            url = f"{base_url}/v1/marketplace/transactions?page={current_page}&perPage={per_page}"
-
-            try:
-                data = get_page(url, headers, config)
-            except Exception as e:
-                print(f"[sync] Falha na página {current_page}: {e}", flush=True)
-                raise RuntimeError(
-                    f"Falha na página {current_page}, com {state['recebidas']} transações já recebidas: {e}. "
-                    "Os dados atuais foram mantidos. Clique em sincronizar para continuar de onde parou."
-                ) from e
-
-            if isinstance(data, dict):
-                page_items = data.get("data", [])
-                last_page = data.get("lastPage", 1)
-            else:
-                page_items = data if isinstance(data, list) else []
-                last_page = current_page
-
-            if not page_items:
-                break  # Se a página vier vazia, terminamos
-
-            datas = pd.to_datetime(
-                pd.Series([tx.get("created_at") for tx in page_items], dtype="object"),
-                errors="coerce", utc=True,
-            )
-            sem_data = datas.isna()
-            manter = (datas >= data_corte) | sem_data
-
-            rows = [parse_transaction(tx) for tx, ok in zip(page_items, manter) if ok]
-            writer.writerows(rows)
-            f.flush()
-
-            state["recebidas"] += len(page_items)
-            state["salvas"] += len(rows)
-            state["sem_data"] += int(sem_data.sum())
-            state["next_page"] = current_page + 1
-            state["offset"] = os.path.getsize(PARTIAL_CSV)
-            save_partial_state(state)
-
-            mais_antiga = datas.min()
-            mais_antiga_txt = mais_antiga.strftime("%d/%m/%Y") if pd.notna(mais_antiga) else "sem data"
-            job["progress"] = (
-                f"Página {current_page} de {last_page} · {len(page_items)} recebidas nesta página · "
-                f"mais antiga: {mais_antiga_txt} · {state['salvas']} salvas de {state['recebidas']}"
-            )
-
-            # Registra nos logs do app, para saber até onde foi se a conexão ou o app cair
-            if current_page % 50 == 0:
-                print(f"[sync] Página {current_page} de {last_page}, mais antiga: {mais_antiga_txt}", flush=True)
-
-            # Para quando uma página inteira estiver fora do período
-            if not manter.any():
-                break
-
-            # Se chegamos na última página possível da API, paramos
-            if current_page >= last_page:
-                break
-
-            current_page += 1
-
-    if state["salvas"] == 0:
-        clear_partial()
-        return False
-
-    if state["sem_data"]:
-        job["aviso"] = (
-            f"{state['sem_data']} transações vieram sem data válida e não entram nos períodos do dashboard."
-        )
-
-    publish_partial()
-    clear_partial()
-    return True
-
-
-def request_sync():
-    if start_sync():
-        st.toast("Sincronização iniciada. Ela continua mesmo se você fechar esta aba.", icon="🔄")
-    else:
-        st.toast("Já existe uma sincronização em andamento.", icon="⏳")
-
-
-def sync_panel():
-    job = sync_job()
-    thread = job["thread"]
-    running = thread is not None and thread.is_alive()
-
-    if "sync_visto" not in st.session_state and not running:
-        st.session_state["sync_visto"] = job["run_id"]
-
-    if running:
-        st.info(f"🔄 {job['progress']} · Pode fechar esta aba: o download continua no servidor.")
-        return
-
-    # O download acabou enquanto esta tela estava aberta: recarrega para mostrar os dados novos
-    if st.session_state.get("sync_visto") != job["run_id"]:
-        st.session_state["sync_visto"] = job["run_id"]
-        if job["status"] == "done":
-            st.toast("Dados atualizados com sucesso!", icon="✅")
-        st.rerun()
-
-    if job["status"] == "error":
-        st.error(f"Erro na sincronização. {job['error']}")
-    elif job["status"] == "empty":
-        st.warning("Nenhum dado novo encontrado.")
-    elif job["aviso"]:
-        st.warning(job["aviso"])
-    elif load_partial_state() is not None:
-        st.info("Há um download incompleto. Clique em sincronizar para continuar de onde parou.")
-
-
-def render_sync_panel():
-    thread = sync_job()["thread"]
-    running = thread is not None and thread.is_alive()
-    # Só atualiza sozinho enquanto há um download rodando
-    st.fragment(sync_panel, run_every="2s" if running else None)()
-
-
-# --- INTERFACE NO STREAMLIT ---
-with st.sidebar:
-    st.markdown("---")
-    st.markdown("<p class='sidebar-title'>Gerenciamento de Dados</p>", unsafe_allow_html=True)
-
-    if st.button("🔄 Sincronizar Paytime", type="primary", use_container_width=True):
-        request_sync()
-
-st.markdown("<p class='dash-title'><span>Nummy</span> · Dashboard de Churn</p>", unsafe_allow_html=True)
-
-# 1. Cria uma área amigável para o cliente atualizar os dados
-with st.expander("🔄 Atualizar Dados da Paytime", expanded=False):
-    st.write("Clique no botão abaixo para buscar as transações mais recentes da API.")
-
-    if st.button("Buscar Novas Transações", type="primary"):
-        request_sync()
-
-render_sync_panel()
-
-st.markdown("---")
 
 st.set_page_config(
     page_title="Nummy · Dashboard de Churn",
@@ -542,7 +228,7 @@ def date_selector(prefix, default_date, all_years, dias, meses, label):
     try:    return datetime.date(a, m_num, d)
     except: return default_date
 
-# csv_mtime entra na chave do cache: quando a sincronização grava um CSV novo, os dados são relidos
+# csv_mtime entra na chave do cache: quando chega um CSV novo, os dados são relidos
 @st.cache_data(max_entries=1)
 def load_data(path, csv_mtime):
     df = pd.read_csv(path, sep=";", encoding="utf-8-sig", dtype=str)
@@ -576,19 +262,38 @@ def count_by_est(df_period):
 
 
 # Carregamento
-CSV_PATH = "export_transacoes.csv"
-
 st.markdown(f"""
 <p class="dash-title"><span>Nummy</span> · Dashboard de Churn</p>
 <p class="dash-subtitle">Churn = estabelecimentos que transacionaram no P1 mas nao no P2 · Gateway: PAYTIME</p>
 """, unsafe_allow_html=True)
 
+data_asset = None
+try:
+    data_asset = sync_local_data()
+except (requests.exceptions.RequestException, OSError, EOFError) as e:
+    print(f"Falha ao buscar os dados: {type(e).__name__}", flush=True)
+    if os.path.exists(CSV_PATH):
+        st.warning("Não foi possível verificar se há dados novos. Mostrando a última versão baixada.")
+    else:
+        st.error("Não foi possível baixar os dados. Tente novamente em alguns minutos.")
+        st.stop()
+
 try:
     csv_mtime = os.path.getmtime(CSV_PATH)
     df_raw = load_data(CSV_PATH, csv_mtime)
 except FileNotFoundError:
-    st.error(f"Arquivo '{CSV_PATH}' nao encontrado.")
+    st.info("Os dados ainda não foram publicados. A primeira sincronização pode levar algumas horas.")
     st.stop()
+
+if data_asset is not None:
+    atualizado_em = datetime.datetime.fromisoformat(data_asset["updated_at"].replace("Z", "+00:00"))
+    if datetime.datetime.now(datetime.timezone.utc) - atualizado_em > STALE_AFTER:
+        st.warning(
+            f"Os dados não são atualizados desde {atualizado_em.astimezone(BRASILIA).strftime('%d/%m/%Y %H:%M')}. "
+            "Verifique a sincronização no GitHub Actions."
+        )
+    with st.sidebar:
+        st.caption(f"Dados atualizados em {atualizado_em.astimezone(BRASILIA).strftime('%d/%m/%Y %H:%M')}")
 
 all_dates = sorted(df_raw["date"].dropna().unique())
 min_date  = all_dates[0]
